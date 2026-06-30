@@ -31,33 +31,43 @@ def _ensure_client():
 
 
 def _embed(texts: list[str], task_type: str = "retrieval_document") -> np.ndarray:
-    """Embed a list of texts via Gemini, batching to respect API limits.
-
-    task_type matters for this model: "retrieval_document" for corpus
-    chunks at ingest time, "retrieval_query" for the user's question at
-    search time - Gemini's embedding model is trained asymmetrically for
-    these two roles, so using the wrong one quietly hurts retrieval quality.
-    """
     _ensure_client()
     all_vecs = []
     batch_size = config.EMBEDDING_BATCH_SIZE
+    # Free tier: 100 requests/minute for embed_content. Pace requests so we
+    # don't burst past that limit and rely on retries to dig out of a hole.
+    min_interval_seconds = 65  # one batch of ~100 items already exhausts the
+                            # 100/minute free-tier quota - must wait out
+                            # the full window before the next batch
+
     for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
-        for attempt in range(5):
+        for attempt in range(6):
             try:
+                start = time.time()
                 result = genai.embed_content(
                     model=config.EMBEDDING_MODEL,
                     content=batch,
                     task_type=task_type,
                 )
                 all_vecs.extend(result["embedding"])
+                elapsed = time.time() - start
+                if elapsed < min_interval_seconds:
+                    time.sleep(min_interval_seconds - elapsed)
                 break
             except Exception as e:
-                if attempt == 4:
+                if attempt == 5:
                     raise
-                wait = 2 ** attempt
-                print(f"  embed batch failed ({e}); retrying in {wait}s...")
+                # Use the server's suggested retry_delay if present, else
+                # fall back to exponential backoff with a higher ceiling
+                # than before (free-tier resets are typically ~60s).
+                retry_delay = getattr(e, "retry_delay", None)
+                wait = retry_delay.seconds if retry_delay else min(60, 2 ** (attempt + 3))
+                print(f"  embed batch {i // batch_size} failed ({type(e).__name__}); retrying in {wait}s...")
                 time.sleep(wait)
+
+        if (i // batch_size) % 5 == 0:
+            print(f"  embedded {min(i + batch_size, len(texts))}/{len(texts)} chunks")
 
     vecs = np.array(all_vecs, dtype="float32")
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
